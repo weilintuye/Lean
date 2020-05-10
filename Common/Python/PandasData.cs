@@ -32,7 +32,6 @@ namespace QuantConnect.Python
     public class PandasData
     {
         private static dynamic _pandas;
-        private static dynamic _remapperFactory;
         private readonly static HashSet<string> _baseDataProperties = typeof(BaseData).GetProperties().ToHashSet(x => x.Name.ToLowerInvariant());
         private readonly static ConcurrentDictionary<Type, List<MemberInfo>> _membersByType = new ConcurrentDictionary<Type, List<MemberInfo>>();
 
@@ -60,103 +59,165 @@ namespace QuantConnect.Python
             {
                 using (Py.GIL())
                 {
-                    _pandas = Py.Import("pandas");
-
                     // this python Remapper class will work as a proxy and adjust the
                     // input to its methods using the provided 'mapper' callable object
-                    _remapperFactory = PythonEngine.ModuleFromString("remapper",
+                    _pandas = PythonEngine.ModuleFromString("remapper",
                         @"import pandas as pd
-from inspect import getmembers, isdatadescriptor, isfunction, isgenerator
+from pandas.core.indexes.frozen import FrozenList as pdFrozenList
+from inspect import getmembers, isfunction, isgenerator
 from functools import partial
+from sys import modules
+
 from clr import AddReference
 AddReference(""QuantConnect.Common"")
 from QuantConnect import Symbol, SymbolCache
 
+def mapper(key):
+    keyType = type(key)
+    if keyType is Symbol:
+        return str(key.ID)
+    if keyType is str:
+        kvp = SymbolCache.TryGetSymbol(key, None)
+        if kvp[0]:
+            return str(kvp[1].ID)
+    if keyType is tuple:
+        return tuple([mapper(x) for x in key])
+    if keyType is dict:
+        return {k:mapper(v) for k,v in key.items()}
+    return key
+
+def try_wrap_as_index(obj):
+    objType = type(obj)
+
+    if objType is pd.Index:
+        return True, Index(obj)
+
+    if objType is pd.MultiIndex:
+        result = object.__new__(MultiIndex)
+        result._set_levels(obj.levels, copy=obj.copy, validate=False)
+        result._set_codes(obj.codes, copy=obj.copy, validate=False)
+        result._set_names(obj.names)
+        result.sortorder = obj.sortorder
+        return True, result
+
+    if objType is pdFrozenList:
+        return True, FrozenList(obj)
+
+    return False, obj
+
+def try_wrap_as_pandas(obj):
+    success, obj = try_wrap_as_index(obj)
+    if success:
+        return success, obj
+
+    objType = type(obj)
+
+    if objType is pd.DataFrame:
+        return True, DataFrame(data=obj)
+
+    if objType is pd.Series:
+        return True, Series(data=obj)
+
+    return False, obj
+
+def wrap_function(f):
+    def g(*args, **kwargs):
+
+        if len(args) > 1:
+            args = mapper(args)
+        if len(kwargs) > 0:
+            kwargs = mapper(kwargs)
+
+        result = f(*args, **kwargs)
+
+        success, result = try_wrap_as_pandas(result)
+        if success:
+            return result
+
+        if isgenerator(result):
+            return ( (k, try_wrap_as_pandas(v)[1]) for k, v in result)
+
+        return result
+
+    g.__name__ = f.__name__
+    return g
+
 def CreateWrappedClass(cls: type):
 
-    def _mapper(key):
-        keyType = type(key)
-        if keyType is Symbol:
-            return str(key.ID)
-        if keyType is str:
-            kvp = SymbolCache.TryGetSymbol(key, None)
-            if kvp[0]:
-                return str(kvp[1].ID)
-        if keyType is tuple:
-            return tuple([_mapper(x) for x in key])
-        if keyType is dict:
-            return {k:_mapper(v) for k,v in key.items()}
-        return key
+    # Define a new class
+    klass = type(f'{cls.__name__}', (cls,) + cls.__bases__, dict(cls.__dict__))
 
-    def wrap_if_pandas(obj):
+    # Wrap '__getattribute__' to wrap indices
+    def g(self, name):
+        attr = object.__getattribute__(self, name)
+        if name in ['columns', 'index', 'levels']:
+            _, attr = try_wrap_as_index(attr)
+        return attr
+    g.__name__ =  '__getattribute__'
+    g.__qualname__ =  g.__name__
+    setattr(klass, g.__name__, g)
 
-        objType = type(obj)
+    def wrap_union(f):
 
-        if objType is pd.DataFrame:
-            return DataFrame(data=obj)
-        if objType is pd.Series:
-            return Series(data=obj)
-        if objType is pd.Index:
-            return Index(obj)
-        if objType is pd.MultiIndex:
-            return MultiIndex(
-                levels=obj.levels,
-                codes=obj.codes,
-                sortorder=obj.sortorder,
-                names=obj.names,
-                dtype=obj.dtype,
-                copy=obj.copy,
-                name=obj.name)
+        def unwrap_index(obj):
+            objType = type(obj)
 
-        return obj
+            if objType is Index:
+                return pd.Index(obj)
 
-    def wrap_function(f):
+            if objType is MultiIndex:
+                result = object.__new__(pd.MultiIndex)
+                result._set_levels(obj.levels, copy=obj.copy, validate=False)
+                result._set_codes(obj.codes, copy=obj.copy, validate=False)
+                result._set_names(obj.names)
+                result.sortorder = obj.sortorder
+                return result
+
+            if objType is FrozenList:
+                return pdFrozenList(obj)
+
+            return obj
+
         def g(*args, **kwargs):
 
-            if len(args) > 1:
-                args = _mapper(args)
-            if len(kwargs) > 0:
-                kwargs = _mapper(kwargs)
-
+            args = tuple([unwrap_index(x) for x in args])
             result = f(*args, **kwargs)
-            return wrap_if_pandas(result)
+            _, result = try_wrap_as_index(result)
+            return result
 
         g.__name__ = f.__name__
         return g
 
-    # Define a new class
-    newCls = type(f'{cls.__name__}', (cls,) + cls.__bases__, dict(cls.__dict__))
+    allow_list = [ '__contains__', '__getitem__']
 
-    allow_list = ['__contains__', '__getitem__']
-
-    for name, member in getmembers(newCls):
+    for name, member in getmembers(klass):
         if name.startswith('_') and name not in allow_list:
             continue
 
         if isfunction(member):
-            setattr(newCls, name, wrap_function(member))
+            if name == 'union':
+                member = wrap_union(member)
+            else:
+                member = wrap_function(member)
+            setattr(klass, name, member)
 
-        elif isdatadescriptor(member):
-            memberType = type(member)
-            if memberType is pd._libs.properties.AxisProperty:
-                fcls = CreateWrappedClass(memberType)
-                member = fcls(member.axis, member.__doc__)
-            elif memberType is property:
-                if type(member.fget) is not partial:
-                    fget = wrap_function(member.fget)
-                else:
-                    func = CreateWrappedClass(member.fget.func)
-                    fget = partial(func, name)
-                member = property(fget, member.fset, member.fdel, member.__doc__)
-            setattr(newCls, name, member)
+        elif type(member) is property:
+            if type(member.fget) is partial:
+                func = CreateWrappedClass(member.fget.func)
+                fget = partial(func, name)
+            else:
+                fget = wrap_function(member.fget)
+            member = property(fget, member.fset, member.fdel, member.__doc__)
+            setattr(klass, name, member)
 
-    return newCls
+    return klass
 
-DataFrame = CreateWrappedClass(pd.DataFrame)
-Series = CreateWrappedClass(pd.Series)
+FrozenList = CreateWrappedClass(pdFrozenList)
 Index = CreateWrappedClass(pd.Index)
-MultiIndex = CreateWrappedClass(pd.MultiIndex)")
-                        .GetAttr("DataFrame");
+MultiIndex = CreateWrappedClass(pd.MultiIndex)
+Series = CreateWrappedClass(pd.Series)
+DataFrame = CreateWrappedClass(pd.DataFrame)
+setattr(modules[__name__], 'concat', wrap_function(pd.concat))");
                 }
             }
 
@@ -402,7 +463,7 @@ MultiIndex = CreateWrappedClass(pd.MultiIndex)")
                     pyDict.SetItem(kvp.Key, _pandas.Series(values, index));
                 }
                 _series.Clear();
-                return ApplySymbolMapper(_pandas.DataFrame(pyDict));
+                return _pandas.DataFrame(pyDict);
             }
         }
 
@@ -439,14 +500,6 @@ MultiIndex = CreateWrappedClass(pd.MultiIndex)")
             return baseType.IsAssignableFrom(type)
                 ? baseType.GetProperties().Select(x => x.Name.ToLowerInvariant())
                 : Enumerable.Empty<string>();
-        }
-
-        /// <summary>
-        /// Will wrap the provided pandas data frame using the <see cref="_remapperFactory"/>
-        /// </summary>
-        internal static dynamic ApplySymbolMapper(dynamic pandasDataFrame)
-        {
-            return _remapperFactory.Invoke(pandasDataFrame);
         }
     }
 }
