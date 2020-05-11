@@ -125,6 +125,16 @@ def try_wrap_as_pandas(obj):
     if objType is pd.Series:
         return True, Series(data=obj)
 
+    if objType is tuple:
+        anySuccess = False
+        results = list()
+        for item in obj:
+            success, result = try_wrap_as_pandas(item)
+            anySuccess |= success
+            results.append(result)
+        if anySuccess:
+            return True, tuple(results)
+
     return False, obj
 
 def wrap_function(f):
