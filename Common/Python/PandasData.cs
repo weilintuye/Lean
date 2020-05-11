@@ -73,6 +73,9 @@ AddReference(""QuantConnect.Common"")
 from QuantConnect import Symbol, SymbolCache
 
 def mapper(key):
+    '''Maps a Symbol object or a Symbol Ticker (string) to the string representation of
+    Symbol SecurityIdentifier. If cannot map, returns the object
+    '''
     keyType = type(key)
     if keyType is Symbol:
         return str(key.ID)
@@ -87,6 +90,8 @@ def mapper(key):
     return key
 
 def try_wrap_as_index(obj):
+    '''Tries to wrap object if it is one of pandas' index objects.'''
+
     objType = type(obj)
 
     if objType is pd.Index:
@@ -106,6 +111,8 @@ def try_wrap_as_index(obj):
     return False, obj
 
 def try_wrap_as_pandas(obj):
+    '''Tries to wrap object if it is a pandas' object.'''
+
     success, obj = try_wrap_as_index(obj)
     if success:
         return success, obj
@@ -121,6 +128,10 @@ def try_wrap_as_pandas(obj):
     return False, obj
 
 def wrap_function(f):
+    '''Wraps function f with g.
+    Function g converts the args/kwargs to use alternative index keys
+    and the result of the f function call to the wrapper objects
+    '''
     def g(*args, **kwargs):
 
         if len(args) > 1:
@@ -142,13 +153,17 @@ def wrap_function(f):
     g.__name__ = f.__name__
     return g
 
-def CreateWrappedClass(cls: type):
-
+def CreateWrapperClass(cls: type):
+    '''Creates wrapper classes.
+    Members of the original class are wrapped to allow alternative index look-up  
+    '''
     # Define a new class
     klass = type(f'{cls.__name__}', (cls,) + cls.__bases__, dict(cls.__dict__))
 
-    # Wrap '__getattribute__' to wrap indices
     def g(self, name):
+        '''Wrap '__getattribute__' to handle indices
+        Only need to wrap columns, index and levels attributes
+        '''
         attr = object.__getattribute__(self, name)
         if name in ['columns', 'index', 'levels']:
             _, attr = try_wrap_as_index(attr)
@@ -158,8 +173,14 @@ def CreateWrappedClass(cls: type):
     setattr(klass, g.__name__, g)
 
     def wrap_union(f):
-
+        '''Wraps function f (union) with g.
+        Special case: The union method from index objects needs to
+        receive pandas' index objects to avoid infity recursion.
+        Function g converts the args/kwargs objects to one of pandas index objects
+        and the result of the f function call back to wrapper indexes objects
+        '''
         def unwrap_index(obj):
+            '''Tries to unwrap object if it is one of this module wrapper's index objects.'''
             objType = type(obj)
 
             if objType is Index:
@@ -190,6 +211,7 @@ def CreateWrappedClass(cls: type):
 
     allow_list = [ '__contains__', '__getitem__']
 
+    # Wrap class members of the newly created class 
     for name, member in getmembers(klass):
         if name.startswith('_') and name not in allow_list:
             continue
@@ -203,7 +225,7 @@ def CreateWrappedClass(cls: type):
 
         elif type(member) is property:
             if type(member.fget) is partial:
-                func = CreateWrappedClass(member.fget.func)
+                func = CreateWrapperClass(member.fget.func)
                 fget = partial(func, name)
             else:
                 fget = wrap_function(member.fget)
@@ -212,11 +234,11 @@ def CreateWrappedClass(cls: type):
 
     return klass
 
-FrozenList = CreateWrappedClass(pdFrozenList)
-Index = CreateWrappedClass(pd.Index)
-MultiIndex = CreateWrappedClass(pd.MultiIndex)
-Series = CreateWrappedClass(pd.Series)
-DataFrame = CreateWrappedClass(pd.DataFrame)
+FrozenList = CreateWrapperClass(pdFrozenList)
+Index = CreateWrapperClass(pd.Index)
+MultiIndex = CreateWrapperClass(pd.MultiIndex)
+Series = CreateWrapperClass(pd.Series)
+DataFrame = CreateWrapperClass(pd.DataFrame)
 setattr(modules[__name__], 'concat', wrap_function(pd.concat))");
                 }
             }
